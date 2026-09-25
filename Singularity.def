@@ -1,0 +1,16 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+%files
+    requirements.txt /opt/test44/requirements.txt
+
+%post
+    python -m pip install --no-cache-dir -r /opt/test44/requirements.txt
+
+%environment
+    export PYTHONNOUSERSITE=1
+    export PYTHONUNBUFFERED=1
+    export MPLBACKEND=Agg
+
+%test
+    python -c 'import torch, ase, numpy; print(torch.__version__, ase.__version__, numpy.__version__)'

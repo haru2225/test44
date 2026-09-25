@@ -1,0 +1,48 @@
+# β-cristobalite 2x2x2 CG data-generation MD (LAMMPS + Vashishta SiO2)
+# One replica; expects SEED and REPLICA passed via -var. Output goes to
+# md/traj_${REPLICA}.lammpstrj.
+#
+# Usage:
+#   lmp -in md/silica_beta_cristobalite.in \
+#       -var TEMP 300 -var NSTEPS 2000000 -var DUMP_EVERY 200 \
+#       -var SEED 42 -var REPLICA 0
+#
+# Defaults: 2,000,000 steps × 1 fs = 2 ns, dump every 200 fs → 10,000 frames.
+
+variable        TEMP       index 300
+variable        NSTEPS     index 2000000
+variable        DUMP_EVERY index 200
+variable        EQ_STEPS   index 20000
+variable        SEED       index 42
+variable        REPLICA    index 0
+
+units           metal
+boundary        p p p
+atom_style      atomic
+
+read_data       md/silica_beta_cristobalite_init.data
+
+variable        POT getenv LAMMPS_POTENTIALS
+pair_style      vashishta
+pair_coeff      * * ${POT}/SiO.1990.vashishta Si O
+
+velocity        all create ${TEMP} ${SEED} mom yes rot yes dist gaussian
+
+timestep        0.001                       # 1 fs (metal units → ps)
+
+# NVT equilibration
+fix             eqnvt all nvt temp ${TEMP} ${TEMP} 0.1
+run             ${EQ_STEPS}
+unfix           eqnvt
+
+# NPT production (isotropic cell breathing)
+fix             prod all npt temp ${TEMP} ${TEMP} 0.1 iso 0.0 0.0 1.0
+
+thermo          5000
+thermo_style    custom step temp press vol pe density
+
+dump            traj all custom ${DUMP_EVERY} md/traj_${REPLICA}.lammpstrj &
+                id type xu yu zu
+dump_modify     traj sort id append no format float %.6f
+
+run             ${NSTEPS}

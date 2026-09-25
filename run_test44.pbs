@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+#PBS -q sg8
+#PBS -N test44_crystal
+#PBS -l walltime=20:00:00
+#PBS -l select=1:ncpus=8:mpiprocs=1:ompthreads=8:mem=32gb:ngpus=1
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$(dirname "${BASH_SOURCE[0]}")}"
+work_dir="$(pwd -P)"
+stage="${STAGE:-train}"
+nrep="${NREP:-5}"
+
+if [[ -n "${DATASET_PATH:-}" ]]; then
+    dataset="$DATASET_PATH"
+elif [[ "$stage" == train || "$stage" == generate || "$stage" == check ]]; then
+    dataset="$work_dir/examples/crystal"
+else
+    dataset="$work_dir/input/dataset"
+fi
+train_dir="${TRAIN_DIR:-$work_dir/results/egnn_source_train}"
+
+# --- LAMMPS stage: (re)generate the crystal NPT trajectories, if not
+# already present. Not needed for the bundled examples/crystal dataset
+# (already prepared); only relevant if you want fresh/more replicas.
+run_lammps() {
+    module load lammps >/dev/null 2>&1 || true
+    local lmp_bin="${LMP_BIN:-lmp}"
+    : "${LAMMPS_POTENTIALS:?Set LAMMPS_POTENTIALS to the Vashishta potential directory}"
+    local pids=() r seed
+    for ((r = 0; r < nrep; r++)); do
+        [[ -s "md/traj_${r}.lammpstrj" ]] && continue
+        seed=$((17 + 31 * r))
+        echo "[lammps] crystal replica $r (seed=$seed)" >&2
+        "$lmp_bin" -in md/silica_beta_cristobalite.in \
+            -var TEMP "${MD_TEMP:-300}" -var NSTEPS "${MD_NSTEPS:-2000000}" \
+            -var DUMP_EVERY "${MD_DUMP_EVERY:-200}" -var EQ_STEPS "${MD_EQ_STEPS:-20000}" \
+            -var SEED "$seed" -var REPLICA "$r" -log "md/log.${r}" &
+        pids+=($!)
+    done
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        echo "[lammps] all $nrep replicas already present, skipping" >&2
+    else
+        wait "${pids[@]}"
+    fi
+}
+
+if [[ "$stage" == lammps ]]; then
+    run_lammps
+    exit 0
+fi
+
+runtime="${CONTAINER_RUNTIME:-singularity}"
+if ! command -v "$runtime" >/dev/null 2>&1 && command -v apptainer >/dev/null 2>&1; then
+    runtime=apptainer
+fi
+command -v "$runtime" >/dev/null 2>&1 || { echo 'Load Singularity or Apptainer first.' >&2; exit 2; }
+sif="${SIF_IMAGE:-$work_dir/test44.sif}"
+[[ -r "$sif" ]] || { echo "Missing container: $sif" >&2; exit 2; }
+bind_args=(--bind "$work_dir:$work_dir")
+if [[ -n "${EXTRA_BIND:-}" ]]; then bind_args+=(--bind "$EXTRA_BIND"); fi
+
+# Verify the bound source tree and GPU runtime before a long training job.
+if [[ "$stage" == check ]]; then
+    "$runtime" exec --nv "${bind_args[@]}" --pwd "$work_dir" "$sif" \
+        python "$work_dir/check_runtime.py" --dataset "$dataset"
+    exec "$runtime" exec "${bind_args[@]}" --pwd "$work_dir" "$sif" \
+        python -m pytest -q "$work_dir/test_test44.py"
+fi
+
+run_prepare() {
+    if [[ -s "$dataset/metadata.json" ]]; then
+        echo "[prepare] dataset already present at $dataset, skipping" >&2
+        return 0
+    fi
+    local files=() r
+    for ((r = 0; r < nrep; r++)); do files+=("md/traj_${r}.lammpstrj"); done
+    "$runtime" exec "${bind_args[@]}" --pwd "$work_dir" "$sif" \
+        python -u "$work_dir/test44.py" prepare \
+        --input "${files[@]}" --input-format lammps-dump-text --lammps-types 14 8 \
+        --index "${PREPARE_INDEX:-1000::300}" --split-gap "${PREPARE_SPLIT_GAP:-2}" \
+        --output "$dataset"
+}
+
+case "$stage" in
+    full)
+        run_lammps
+        run_prepare
+        stage_run=train
+        ;;
+    prepare)
+        run_prepare
+        exit 0
+        ;;
+    train) stage_run=train ;;
+    generate) stage_run=generate ;;
+    *) echo 'STAGE must be check, full, lammps, prepare, train or generate' >&2; exit 2 ;;
+esac
+
+case "$stage_run" in
+    train)
+        args=(train --dataset "$dataset" --output "$train_dir"
+              --updates "${UPDATES:-30000}" --batch-size "${BATCH_SIZE:-8}"
+              --width "${WIDTH:-256}" --layers "${LAYERS:-4}"
+              --hidden-layers "${HIDDEN_LAYERS:-4}"
+              --sigma-min "${SIGMA_MIN:-0.03}" --cutoff "${CUTOFF:-5.5}"
+              --learning-rate "${LEARNING_RATE:-0.0002}"
+              --weight-decay "${WEIGHT_DECAY:-5e-8}" --log-every "${LOG_EVERY:-100}")
+        # Unset: sigma-max defaults to 1.5 A (test42: cell size ~13.5 A).
+        if [[ -n "${SIGMA_MAX:-}" ]]; then args+=(--sigma-max "$SIGMA_MAX"); fi
+        ;;
+    generate)
+        args=(generate --checkpoint "${CHECKPOINT_PATH:-$train_dir/checkpoint.pt}"
+              --steps "${STEPS:-3000}" --extra-noise "${EXTRA_NOISE:-2.0}" --output "${GENERATED_DIR:-$work_dir/results/egnn_source_seed${SEED:-1337}}")
+        if [[ -n "${FRAME:-}" ]]; then args+=(--frame "$FRAME"); fi
+        ;;
+esac
+walltime_hours="${WALLTIME_HOURS:-20}"
+default_budget=$(awk -v w="$walltime_hours" -v s="$SECONDS" \
+    'BEGIN { b = w - s / 3600 - 0.5; if (b < 0.1) b = 0.1; printf "%.2f", b }')
+args+=(--device cuda --seed "${SEED:-1337}" --checkpoint-every "${CHECKPOINT_EVERY:-100}"
+       --time-budget-hours "${TIME_BUDGET_HOURS:-$default_budget}")
+case "${RESUME:-0}" in 0) ;; 1) args+=(--resume) ;; *) echo 'RESUME must be 0 or 1' >&2; exit 2;; esac
+exec "$runtime" exec --nv "${bind_args[@]}" --pwd "$work_dir" \
+    --env OMP_NUM_THREADS=8 --env MKL_NUM_THREADS=8 \
+    "$sif" python -u "$work_dir/test44.py" "${args[@]}"
